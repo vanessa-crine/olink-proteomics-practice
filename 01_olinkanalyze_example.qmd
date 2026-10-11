@@ -1,0 +1,376 @@
+---
+title: "Olink proteomics: a guided analysis pipeline"
+author: Vanessa Crine
+format:
+  html:
+    toc: true
+    code-fold: true      # code is hidden but can be opened with one click
+editor: visual
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+## 0. Key concepts
+
+**PEA (Proximity Extension Assay).** Two antibodies, each carrying a DNA tag, bind the same protein. When both are bound, the tags are close enough to join into a DNA barcode, which is then counted: by qPCR on Olink Target panels (48 or 96 proteins) or by next-generation sequencing on Olink Explore (about 3,000 to 5,400 proteins). Needing two antibodies per protein gives high specificity.
+
+**NPX (Normalized Protein eXpression).** Olink's relative unit, on a log2 scale: +1 NPX means roughly twice as much protein. NPX can be compared between samples for the same protein, but not between proteins, because it is not an absolute concentration.
+
+**LOD (Limit of Detection).** Values below the LOD are close to background noise. Common practice is to keep them in most analyses (Olink's recommendation), but to report or exclude proteins where most samples are below LOD (see the `MissingFreq` column).
+
+**QC warnings.** Each sample gets `Pass` or `Warning` per panel, based on internal controls added to every well (incubation, extension and detection controls). Samples with warnings are checked and usually excluded.
+
+**Plates, batches and normalisation.** Samples are run on 96-well plates. Olink normalises within each plate (intensity normalisation or plate controls). When data come from separate runs (batches), bridge samples measured in both are used to shift one dataset onto the other's scale (bridging normalisation).
+
+**UK Biobank Pharma Proteomics Project (UKB-PPP).** Olink Explore 3072 measured about 2,900 proteins in about 54,000 UK Biobank participants. The data are accessed through the UK Biobank Research Analysis Platform (RAP). This is one of the main datasets the Marseglia group uses, alongside the Gothenburg H70 cohorts.
+
+**Typical downstream analyses in the job ad.**
+
+- Dimension reduction and clustering: PCA, UMAP, hierarchical clustering of protein profiles
+- Pathway analysis: over-representation analysis (ORA) or GSEA on GO or Reactome
+- Biomarker identification: association models (linear and mixed models, Cox models for dementia incidence) and machine learning (LASSO, elastic net, random forest) with cross-validation
+
+### The pipeline used in this report
+
+| Step | What | OlinkAnalyze functions |
+|----|----|----|
+| 1 | **Load and explore**: count samples, proteins, panels, plates | `glimpse()`, `count()`, `n_distinct()` |
+| 2 | **Data check**: column names, duplicate or missing IDs | `check_npx()` |
+| 3 | **Sample QC**: remove controls; inspect distributions and IQR vs median; drop `Warning` samples | `olink_dist_plot()`, `olink_qc_plot()`, `filter(QC_Warning == "Pass")` |
+| 4 | **Protein QC (LOD)**: share of samples below LOD per protein; drop proteins above the cut-off (50% or 75%), keep below-LOD values for the rest | `group_by(OlinkID)` + `summarise(mean(NPX < LOD))` |
+| 5 | **Batch and outlier check**: PCA coloured by plate (batch effect?) and by group (biology?) | `olink_pca_plot()`, `olink_umap_plot()` |
+| 6 | **Bridging** (only when combining runs): align batch 2 to batch 1 using bridge samples; keep one copy of each bridge sample | `olink_bridgeselector()`, `olink_normalization()` |
+| 7 | **Differential expression** (one timepoint, two groups): estimate = log2 fold change, Benjamini-Hochberg adjusted p-values | `olink_ttest()`, `olink_anova()`, `olink_volcano_plot()` |
+| 8 | **Repeated measures**: one mixed model per protein with a time × group interaction and a random intercept per person | `olink_lmer()`, `olink_lmer_posthoc()`, `olink_lmer_plot()` |
+| 9 | **Patterns and biology**: heatmap with clustering; pathway enrichment of the test results | `olink_heatmap_plot()`, `olink_pathway_enrichment()` |
+| 10 | **Prediction** (outside OlinkAnalyze): wide format, elastic net with nested cross-validation | `pivot_wider()`, `glmnet::cv.glmnet()` |
+| 11 | **Report**: Quarto document with code, figures and a short methods paragraph; public GitHub repo with a README |  |
+
+**Practical note.** In OlinkAnalyze 4 and later, tables can carry a hidden data-check report. After filtering rows (for example removing duplicate bridge samples), refresh it with `rm_check_log()`, otherwise later functions use the outdated report.
+
+## 1. Setup
+
+Packages are installed once (in the Console, not in this file) and loaded every session with `library()`. `msigdbr` and `clusterProfiler` only need to be installed: `olink_pathway_enrichment()` calls them itself. `umap` is needed by `olink_umap_plot()`.
+
+```{r}
+#| label: setup
+
+# Run these once in the Console, not here:
+# install.packages(c("OlinkAnalyze", "tidyverse", "lme4", "lmerTest", "glmnet",
+#                    "ranger", "pROC", "pheatmap", "broom", "msigdbr", "umap"))
+# install.packages("BiocManager")
+# BiocManager::install("clusterProfiler")
+
+library(OlinkAnalyze)  # Olink QC, normalisation, statistics and plots
+library(tidyverse)     # data wrangling and plots (dplyr, tidyr, stringr, ggplot2)
+library(lme4)          # mixed models
+library(lmerTest)      # p-values for mixed models
+library(glmnet)        # elastic net / LASSO
+library(ranger)        # random forest
+library(pROC)          # ROC curves and AUC
+library(pheatmap)      # clustered heatmaps
+library(broom)         # tidy model output
+library(umap)          # UMAP plots
+```
+
+## 2. Load and inspect the data
+
+The example data `npx_data1` come with OlinkAnalyze. They are in **long format**: one row per tube × protein. So the number of rows is (number of tubes) × (number of proteins), not the number of people.
+
+### Olink's measurement columns (every Olink file has these)
+
+- **SampleID**: the tube that was measured. Names containing *CONTROL* are Olink's control samples, not participants.
+- **Index**: the sample's position number in the run.
+- **OlinkID**: unique ID of the assay (the test for one protein on one panel). Use this as the protein key.
+- **UniProt**: the protein's ID in the UniProt database (for example O00533 = CHL1). Used to look up the protein and for pathway analysis.
+- **Assay**: the protein's short name (gene symbol). It can repeat across panels, so it is not unique.
+- **Panel**: which Olink panel measured it (here Cardiometabolic or Inflammation, 92 proteins each).
+- **Panel_Version**: the panel's version. It matters only when combining data from different years.
+- **PlateID**: the plate the sample ran on. Use it to look for batch effects.
+- **QC_Warning**: *Pass* or *Warning* for this sample on this panel, from Olink's internal controls.
+- **LOD**: limit of detection for this assay; below it, the signal is background noise.
+- **MissingFreq**: share of samples below LOD for this assay (0.019 = 1.9%, so well detected).
+- **NPX**: the protein level, log2 and relative. +1 NPX ≈ twice as much protein.
+
+### Study columns (simulated clinical data that come with the example)
+
+- **Subject**: the person. Each person gave 3 tubes (one per visit). This is the random effect in the mixed models.
+- **Time**: visit (Baseline, Week.6, Week.12).
+- **Treatment**: Treated or Untreated, the group comparison.
+- **Site**: recruitment site; a possible covariate.
+- **Project**: which dataset the row came from. It matters when merging with `npx_data2` (section 5).
+
+The IRIS file has only `Assay`, `NPX` and `Panel` from the first group, plus its own study columns. That is why its QC is more limited.
+
+```{r}
+#| label: load
+
+# With real data: df <- read_NPX("path/to/olink_file.parquet")  # or .csv / .xlsx
+df <- npx_data1
+
+# One line per column: name, type and first values
+glimpse(df)
+
+# Overview: how many tubes, proteins, panels, plates and people?
+df |> summarise(tubes    = n_distinct(SampleID),
+                proteins = n_distinct(OlinkID),
+                panels   = n_distinct(Panel),
+                plates   = n_distinct(PlateID),
+                people   = n_distinct(Subject))
+
+# Which SampleIDs are Olink control samples (not participants)?
+df |> distinct(SampleID) |> filter(str_detect(SampleID, "CONTROL"))
+
+# How many tubes per person? distinct() keeps one row per person-tube pair,
+# count() then counts tubes per person (expect 3: one per visit)
+df |> distinct(Subject, SampleID) |> count(Subject)
+
+# QC status per tube: rows / proteins = number of tubes in each status
+df |> count(QC_Warning) |> mutate(tubes = n / n_distinct(df$OlinkID))
+```
+
+## 3. Quality control
+
+QC answers two questions. **Which tubes can I trust?** (sample QC: controls, QC warnings, outlying distributions.) **Which proteins can I trust?** (protein QC: proteins mostly below the limit of detection carry little information.)
+
+```{r}
+#| label: qc
+
+# 1. Remove Olink control samples: they are technical, not participants
+df_clean <- df |> filter(!str_detect(SampleID, "CONTROL"))
+
+# 2. Data check: OlinkAnalyze looks for missing columns, duplicate IDs, etc.
+#    and stores the result as a "check log" (a report)
+log <- check_npx(df_clean)
+
+# 3. NPX distribution per tube: the boxes should line up.
+#    A shifted box suggests a technical problem with that tube.
+olink_dist_plot(df_clean, color_g = "QC_Warning")
+
+# 4. QC plot: spread (IQR) vs median NPX per tube and panel.
+#    Tubes more than 3 SD from the mean are flagged as outliers.
+olink_qc_plot(df_clean, color_g = "QC_Warning")
+
+# 5. Protein QC: share of tubes below LOD for each protein
+lod_summary <- df_clean |>
+  group_by(OlinkID, Assay) |>
+  summarise(prop_below_LOD = mean(NPX < LOD, na.rm = TRUE), .groups = "drop") |>
+  arrange(desc(prop_below_LOD))
+head(lod_summary)
+
+# Common rule: keep proteins with at most 75% of tubes below LOD
+keep_assays <- lod_summary |> filter(prop_below_LOD <= 0.75) |> pull(OlinkID)
+
+# 6. Keep tubes that passed QC and proteins that are well detected
+df_clean <- df_clean |>
+  filter(QC_Warning == "Pass", OlinkID %in% keep_assays)
+```
+
+## 4. Dimension reduction: PCA and UMAP
+
+PCA summarises all proteins into a few axes (principal components) that capture the most variation between tubes. Each dot is one tube. We colour the dots to ask: **do tubes group by plate** (a technical batch effect, bad) **or by treatment** (biology, interesting)? Dots far from the rest are possible outliers. UMAP is a non-linear alternative that shows local groupings better but distorts distances. Neither one is a clustering method; they only display the data.
+
+```{r}
+#| label: pca
+
+olink_pca_plot(df_clean, color_g = "PlateID")    # batch effect?
+olink_pca_plot(df_clean, color_g = "Treatment")  # biology?
+olink_umap_plot(df_clean, color_g = "Treatment")
+```
+
+## 5. Bridging normalisation (combining two batches)
+
+`npx_data1` and `npx_data2` were measured in separate runs, so the same protein can read systematically higher in one batch. Some tubes (**bridge samples**) were measured in both. For each protein, the median difference between batches in the bridge samples is the **adjustment factor** (in NPX, log2 units), which is added to batch 2 to put it on batch 1's scale.
+
+```{r}
+#| label: bridging
+
+# 1. Remove control samples and label each batch in our own column
+#    (olink_normalization() keeps the original Project column, so we can't use it)
+b1 <- npx_data1 |> filter(!str_detect(SampleID, "CONTROL")) |> mutate(batch = "batch1")
+b2 <- npx_data2 |> filter(!str_detect(SampleID, "CONTROL")) |> mutate(batch = "batch2")
+
+# 2. Bridge samples = tubes measured in both batches
+bridge <- intersect(b1$SampleID, b2$SampleID)
+length(bridge)   # 16
+
+# 3. PCA before normalisation (each bridge tube kept once, from batch 1):
+#    if the batches form two separate clouds, there is a batch effect
+before <- bind_rows(b1, b2 |> filter(!SampleID %in% bridge))
+olink_pca_plot(before, color_g = "batch")
+
+# 4. Normalise: shift batch 2 onto batch 1's scale
+df_bridged <- olink_normalization(
+  df1 = b1,
+  df2 = b2,
+  overlapping_samples_df1 = bridge,
+  df1_project_nr = "batch1",
+  df2_project_nr = "batch2",
+  reference_project = "batch1"
+)
+
+# 5. Adjustment factors per protein, largest shifts first.
+#    An Adj_factor of 1 means batch 2 read about 2-fold too low for that protein.
+adj <- df_bridged |>
+  distinct(OlinkID, Assay, Adj_factor) |>
+  arrange(desc(abs(Adj_factor)))
+head(adj)
+
+# 6. Bridge tubes are now in the data twice: keep the batch 1 copy.
+#    rm_check_log() drops the old hidden QC report, which still lists the duplicates.
+df_final <- df_bridged |>
+  filter(!(SampleID %in% bridge & batch == "batch2")) |>
+  rm_check_log()
+
+# 7. Check: a single row means every tube has the same number of proteins
+#    (here n = 184 proteins for 312 tubes)
+df_final |> count(SampleID) |> count(n)
+
+# 8. PCA after normalisation: the batches should now overlap
+olink_pca_plot(df_final, color_g = "batch")
+
+# 9. Put the visits in time order (otherwise R sorts them alphabetically:
+#    Baseline, Week.12, Week.6)
+df_final <- df_final |>
+  mutate(Time = factor(Time, levels = c("Baseline", "Week.6", "Week.12")))
+```
+
+## 6. Differential abundance (biomarker identification)
+
+**One timepoint.** At Baseline each person gave one tube, so a simple Welch t-test per protein compares Treated vs Untreated. The **estimate** is the difference in mean NPX (a log2 fold change). With 184 tests, about 9 would be "significant" at p \< 0.05 by chance alone, so p-values are corrected with Benjamini-Hochberg (`Adjusted_pval`).
+
+**All timepoints.** Tubes from the same person are not independent, so we use one **mixed model** per protein: `NPX ~ Time * Treatment + (1 | Subject)`. The random intercept `(1 | Subject)` lets each person have their own baseline level. The **interaction** `Time:Treatment` asks whether the groups change differently over time.
+
+```{r}
+#| label: differential
+
+# 1. Baseline only: Welch t-test per protein, BH-adjusted
+ttest_results <- df_final |>
+  filter(Time == "Baseline") |>
+  olink_ttest(variable = "Treatment")
+ttest_results |> count(Threshold)   # how many proteins are significant?
+
+# 2. Volcano plot: x = NPX difference (log2 fold change), y = -log10(p).
+#    Top right / top left = large and significant differences. Label the top 10.
+top_ids <- ttest_results |> arrange(p.value) |> slice_head(n = 10) |> pull(OlinkID)
+olink_volcano_plot(ttest_results, olinkid_list = top_ids,
+                   x_lab = "Treated - Untreated (NPX)")
+
+# 3. All timepoints: one mixed model per protein
+lmer_results <- olink_lmer(df = df_final,
+                           variable = c("Time", "Treatment"),
+                           random = "Subject")
+lmer_results |> count(term, Threshold)   # significant proteins per model term
+
+# 4. Proteins whose trajectory differs between groups (significant interaction)
+inter_ids <- lmer_results |>
+  filter(term == "Time:Treatment", Threshold == "Significant") |>
+  pull(OlinkID)
+
+# 5. Post-hoc contrasts: at which visit do the groups differ?
+#    (write the formulas without spaces, or the function errors)
+posthoc <- olink_lmer_posthoc(df = df_final, olinkid_list = inter_ids,
+                              model_formula  = "NPX~Time*Treatment+(1|Subject)",
+                              effect_formula = "pairwise~Treatment|Time")
+
+# 6. Trajectories: mean NPX per visit and group, 6 proteins per plot.
+#    The function returns a list of plots, so print them one by one.
+traj_plots <- olink_lmer_plot(df = df_final, variable = c("Time", "Treatment"),
+                              random = "Subject", olinkid_list = inter_ids,
+                              x_axis_variable = "Time", col_variable = "Treatment")
+traj_plots[[1]]   # proteins 1-6
+traj_plots[[2]]   # proteins 7-10
+```
+
+**Results.** In the mixed models, 17 of 184 proteins changed significantly over time, 4 differed by treatment, and 10 had a significant time × treatment interaction (different trajectories). In a cohort study such as UK Biobank, the same model would be adjusted for confounders, for example `covariates = c("age", "sex")` in `olink_lmer()`, or with `lm()` per protein in a loop.
+
+## 7. Change scores
+
+A simple way to summarise a trajectory: for each person and protein, **change = NPX at Week 12 − NPX at Baseline**. A t-test on the change asks whether proteins changed more in Treated than in Untreated. This gives one estimate per protein, which can then be ranked for pathway analysis.
+
+Toy example for one protein: a person with NPX 5.0 at Baseline and 5.8 at Week 12 has a change of +0.8 (about 1.7-fold increase).
+
+```{r}
+#| label: change
+
+# 1. One row per person × protein, with Baseline and Week.12 side by side
+change <- df_final |>
+  filter(Time %in% c("Baseline", "Week.12")) |>
+  select(Subject, Treatment, OlinkID, Assay, UniProt, Panel, Time, NPX) |>
+  pivot_wider(names_from = Time, values_from = NPX) |>
+  mutate(NPX = Week.12 - Baseline) |>
+  filter(!is.na(NPX))   # people missing one of the two visits
+
+# 2. OlinkAnalyze functions expect Olink's standard columns, so add placeholders
+change <- change |>
+  mutate(SampleID = Subject, QC_Warning = "Pass", LOD = -Inf,
+         PlateID = "change", Panel_Version = "NA")
+
+# 3. Mean change per group, and the difference between groups, largest first
+change_summary <- change |>
+  group_by(Assay, Treatment) |>
+  summarise(mean_change = mean(NPX), .groups = "drop") |>
+  pivot_wider(names_from = Treatment, values_from = mean_change) |>
+  mutate(diff = Treated - Untreated) |>
+  arrange(desc(abs(diff)))
+head(change_summary, 10)
+
+# 4. Example: change by group for one protein (dashed line = no change)
+change |>
+  filter(Assay == "CHL1") |>
+  ggplot(aes(x = Treatment, y = NPX)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(width = 0.15, alpha = 0.6) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  labs(y = "Change in NPX (Week 12 − Baseline)", title = "CHL1")
+
+# 5. t-test on the change: estimate = how much more the protein changed in Treated
+ttest_change <- change |> olink_ttest(variable = "Treatment")
+olink_volcano_plot(ttest_change,
+                   x_lab = "Difference in change, Treated − Untreated (NPX)")
+```
+
+## 8. Pathway enrichment
+
+Pathway analysis asks whether proteins from the same biological process (a **pathway**, from databases such as GO or Reactome) move together.
+
+- **ORA (over-representation analysis)** takes only the significant proteins and asks: are more of them in this pathway than expected by chance, given all proteins measured?
+- **GSEA (gene set enrichment analysis)** uses all proteins, ranked by their estimate, and asks: do this pathway's proteins sit at the top (NES \> 0, more increase in Treated) or bottom (NES \< 0) of the list?
+
+Two limits apply to a targeted panel. Only pathways with 10 to 500 measured proteins are tested, and with about 180 proteins few pathways qualify. Also, 65 Olink assay names were not found in the pathway database.
+
+```{r}
+#| label: pathways
+
+# 1. GSEA on the change-score t-test (all proteins, ranked by estimate)
+gsea_change <- olink_pathway_enrichment(df = df_final, test_results = ttest_change,
+                                        method = "GSEA", ontology = "Reactome")
+
+# setSize = measured proteins in the pathway; NES = direction and strength;
+# core_enrichment = the proteins driving the result
+gsea_change |>
+  select(Description, setSize, NES, p.adjust, core_enrichment) |>
+  arrange(p.adjust)
+
+olink_pathway_visualization(enrich_results = gsea_change, method = "GSEA",
+                            number_of_terms = 10)
+olink_pathway_heatmap(enrich_results = gsea_change, test_results = ttest_change,
+                      method = "GSEA", number_of_terms = 10)
+
+# 2. ORA on the significant proteins. Reactome gave no testable pathway
+#    (none had >= 10 measured proteins), so use GO, which has more pathways.
+ora_change <- olink_pathway_enrichment(df = df_final, test_results = ttest_change,
+                                       method = "ORA", ontology = "GO")
+
+# ORA returns NULL when no pathway can be tested, so check before using it
+if (!is.null(ora_change)) {
+  ora_change |>
+    select(Description, Count, GeneRatio, p.adjust, geneID) |>
+    arrange(p.adjust) |>
+    head(10)
+}
+```
+
+**Results.** No pathway reached BH-adjusted p \< 0.05. The leading GSEA terms involved cytokine signalling and adhesion molecules (for example CD40, VCAM1, TNF, OSM), but they were not significant, and several terms were driven by a single protein (CXCL6). These top terms are therefore leads, not findings. Pathway analysis on a \~180-protein targeted panel has limited power; Olink Explore 3072, as used in UK Biobank, would be better suited. The example data are simulated, so no real biology is expected.

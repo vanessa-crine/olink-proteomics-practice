@@ -1,0 +1,496 @@
+---
+title: "Plasma proteomics of COVID-19 severity: an Olink Explore pipeline"
+author: Vanessa Crine
+format:
+  html:
+    toc: true
+    code-fold: true
+editor: visual
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+## About this analysis
+
+**Data.** Massachusetts General Hospital (MGH) emergency department COVID-19 cohort (Filbin et al., *Cell Reports Medicine* 2021). Plasma was measured with **Olink Explore 1536** (about 1,400 proteins on 4 panels: Cardiometabolic, Inflammation, Neurology and Oncology) at **Day 0, 3 and 7** after arrival, plus an extra sample at a clinical event in some patients. The data are public: [Mendeley Data, doi 10.17632/nf853r8xsj](https://data.mendeley.com/datasets/nf853r8xsj/2).
+
+**Question.** Which plasma proteins mark severe COVID-19, defined as death or mechanical ventilation within 28 days? Do their trajectories over the first week differ between severe and non-severe patients? Can a protein signature predict severity?
+
+**What this report demonstrates.**
+
+| Skill | Section |
+|----|----|
+| Proteomics preprocessing: protein QC (LOD), sample QC, outliers | 2 |
+| Normalisation | 2.3 (and the bridging example in report 01) |
+| Dimension reduction and clustering | 2.4, 3 |
+| Biomarker discovery: per-protein models with covariates and FDR | 4 |
+| Pathway analysis (GSEA, ORA) | 5 |
+| Longitudinal analysis: mixed models over Day 0, 3 and 7 | 6 |
+| Machine learning on high-dimensional data: elastic net with nested cross-validation | 7 |
+
+## 1. Setup and data
+
+Put the three files from Mendeley in a folder called `data/` next to this file. They are not uploaded to GitHub.
+
+```{r}
+#| label: setup
+library(tidyverse)   # data wrangling and plots
+library(readxl)      # read .xlsx files
+library(broom)       # tidy model output
+library(lme4)        # mixed models
+library(lmerTest)    # p-values for mixed models
+library(glmnet)      # elastic net
+library(pROC)        # ROC curves and AUC
+library(pheatmap)    # clustered heatmaps
+library(ggrepel)     # non-overlapping labels on plots
+library(OlinkAnalyze)  # pathway enrichment (section 5)
+
+# PCA and elastic net need a complete matrix. The few missing NPX values
+# (18 in total) are replaced by that protein's median.
+impute_median <- function(M) {
+  for (j in seq_len(ncol(M))) M[is.na(M[, j]), j] <- median(M[, j], na.rm = TRUE)
+  M
+}
+```
+
+The three files:
+
+- **Olink Proteomics.xlsx**: NPX values in *wide* format, with one row per tube and one column per protein (OlinkID). `Public ID` is person_day, for example `12_D3`.
+- **Supplemental Table 2, sheet 2A**: one row per protein (OlinkID, Assay, UniProt, LOD, MissingFreq, Panel).
+- **Clinical Metadata.xlsx**: one row per person. `COVID` is 1 or 0. `Acuity` is a severity score on each day, and **lower is worse**: 1 = died, 2 = intubated/ventilated, 3 = needed oxygen, 4 = hospitalised without oxygen, 5 = discharged. `Acuity max` is the worst score within 28 days. Age is in 5 categories (1 = 20–34 up to 5 = 80+).
+
+```{r}
+#| label: load
+npx_wide <- read_excel("data/Olink Proteomics.xlsx", na = "NA") # a few cells are "NA" 
+assays   <- read_excel("data/Supplemental-Table-2-Olink-Assays-NPX-values_v2.xlsx",
+                       sheet = "2A-Olink-Assay", skip = 1)   # header is on row 2
+clin     <- read_excel("data/Clinical Metadata.xlsx", sheet = "Subject-level metadata")
+
+# 1. Drop the repeat tubes (IDs like "43_D7.1" are second measurements of a tube)
+# mixed model expects one tube per person per visit
+npx_wide <- npx_wide |> filter(!str_detect(`Public ID`, "\\."))
+
+# 2. Wide to long: one row per tube x protein, the layout OlinkAnalyze uses
+npx <- npx_wide |>
+  pivot_longer(cols = starts_with("OID"), names_to = "OlinkID", values_to = "NPX") |>
+  filter(!is.na(NPX)) |>  # 18 empty values (NA cells) in 3 proteins
+  rename(SampleID = `Public ID`) |> # SampleID is the name OlinkAnalyze uses
+  mutate(Subject = as.numeric(str_remove(SampleID, "_.*")), # person ID "12_D3" -> 12
+         Day = factor(Day, levels = c("0", "3", "7", "E")))  # E = event sample
+
+# 3. Clinical variables with short names, and the outcome:
+#    severe = died or ventilated within 28 days (Acuity max 1 or 2)
+clin <- clin |>
+  rename(Subject = `Public ID`, age_cat = `Age cat`, acuity_max = `Acuity max`) |>
+  mutate(severe = if_else(acuity_max <= 2, 1, 0)) # Acuity is reverse-coded: 1 = died, 2 = ventilated, 3 = oxygen, 4 = hospital without oxygen, 5 = discharged. So acuity_max <= 2 means “died or ventilated”, and that person gets 1 (severe). Everyone else gets 0.
+
+npx |> distinct(Subject, Day) |> count(Day) # tubes per visit
+clin |> summarise(across(c(D0_draw, D3_draw, D7_draw), ~ sum(.x, na.rm = TRUE))) # draws per visit
+
+# 4. Join protein information and clinical data to every row
+npx <- npx |>
+  left_join(assays, by = "OlinkID") |>
+  left_join(clin |> select(Subject, COVID, age_cat, KIDNEY, severe), by = "Subject")
+
+# Overview
+npx |> summarise(tubes    = n_distinct(SampleID),
+                 people   = n_distinct(Subject),
+                 proteins = n_distinct(OlinkID))
+
+# People by COVID status and severity
+npx |> distinct(Subject, COVID, severe) |> count(COVID, severe)
+
+# Tubes per visit, COVID+ only: who is still sampled at Day 3 and Day 7?
+npx |> filter(COVID == 1) |> distinct(SampleID, Day, severe) |> count(Day, severe)
+```
+
+**Note on missing visits.** Patients were sampled at Day 3 and Day 7 only while still in hospital. Discharged (milder) patients therefore drop out, and later timepoints over-represent severe patients. The data are *missing not at random*. This is the same problem as selective dropout in ageing cohorts, where the sickest or most impaired people leave first.
+
+## 2. Preprocessing and quality control
+
+### 2.1 Protein QC: limit of detection
+
+`MissingFreq` is the share of samples below the limit of detection (LOD) for each protein. Proteins mostly below LOD carry little information, so we keep proteins with at most 75% of samples below LOD. Values below LOD are kept for the remaining proteins, as Olink recommends.
+
+```{r}
+#| label: protein-qc
+ggplot(assays, aes(MissingFreq)) +
+  geom_histogram(bins = 40) +
+  geom_vline(xintercept = 0.75, linetype = "dashed") +
+  labs(x = "Share of samples below LOD", y = "Number of proteins")
+
+keep_ids <- assays |> filter(MissingFreq <= 0.75) |> pull(OlinkID)
+length(keep_ids)                       # proteins kept
+nrow(assays) - length(keep_ids)        # proteins removed
+
+# drop proteins mostly below LOD; within kept proteins, individual values below LOD are kept
+npx <- npx |> filter(OlinkID %in% keep_ids)
+```
+
+### 2.2 Sample QC: outlying tubes
+
+This file has no `QC_Warning` column, so we repeat the idea behind `olink_qc_plot()`. For each tube and panel we compute the median NPX and the spread (IQR). A tube whose median or IQR is more than 3 SD from the panel average is flagged as an outlier: it may have been diluted, haemolysed or mishandled.
+
+```{r}
+#| label: sample-qc
+sample_qc <- npx |>
+  group_by(SampleID, Panel) |>
+  summarise(median_npx = median(NPX), iqr_npx = IQR(NPX), .groups = "drop") |>
+  group_by(Panel) |>
+  mutate(outlier = abs(median_npx - mean(median_npx)) > 3 * sd(median_npx) |
+                   abs(iqr_npx    - mean(iqr_npx))    > 3 * sd(iqr_npx)) |>
+  ungroup()
+
+ggplot(sample_qc, aes(median_npx, iqr_npx, colour = outlier)) +
+  geom_point(alpha = 0.6) +
+  facet_wrap(~ Panel, scales = "free") +
+  labs(x = "Median NPX per tube", y = "IQR of NPX per tube")
+
+outlier_samples <- sample_qc |> filter(outlier) |> distinct(SampleID) |> pull(SampleID)
+length(outlier_samples)   # tubes flagged on at least one panel
+
+npx <- npx |> filter(!SampleID %in% outlier_samples)
+```
+
+### 2.3 Normalisation
+
+Olink delivers NPX already **normalised**. On Explore, each protein is normalised within each plate against an internal extension control and the plate's median (intensity normalisation), and then log2-transformed. No plate IDs are shared here, so no further plate correction is possible. When two separately run studies are combined, **bridging normalisation** with shared bridge samples is needed; that was done on the OlinkAnalyze example data in report 01.
+
+Two checks follow. First, tube medians should be similar across visits; a visit shifted as a whole would point to a technical batch effect. Second, for clustering and machine learning each protein is put on the same scale as a **z-score** (mean 0, SD 1), so proteins with a wide NPX range don't dominate.
+
+```{r}
+#| label: normalisation-check
+npx |>
+  group_by(SampleID, Day, Panel) |>
+  summarise(median_npx = median(NPX), .groups = "drop") |>
+  ggplot(aes(Day, median_npx)) +
+  geom_boxplot() +
+  facet_wrap(~ Panel) +
+  labs(y = "Median NPX per tube")
+```
+
+### 2.4 PCA at Day 0
+
+PCA summarises 1,000+ proteins into a few axes of variation. Each dot is one patient's Day 0 tube. We ask whether patients group by COVID status or severity (biology), and whether any tube is far from the rest (a possible outlier).
+
+```{r}
+#| label: pca
+day0 <- npx |> filter(Day == "0")
+
+# Matrix: one row per tube, one column per protein
+X0 <- day0 |>
+  select(SampleID, OlinkID, NPX) |>
+  pivot_wider(names_from = OlinkID, values_from = NPX) |>
+  column_to_rownames("SampleID") |>
+  as.matrix() |> # turns the table into a pure number matrix as prcomp() needs it
+  impute_median() # fills the few missing values with that protein’s median. PCA can’t handle missing values
+
+pca <- prcomp(X0, scale. = TRUE)  # scale. = TRUE: z-score each protein
+summary(pca)$importance[2, 1:5]   # share of variance for PC1-PC5
+
+pcs <- as_tibble(pca$x[, 1:2], rownames = "SampleID") |>
+  left_join(day0 |> distinct(SampleID, COVID, severe), by = "SampleID") # one row per tube with its labels (COVID, severe), so the join adds labels without duplicating tubes
+
+ggplot(pcs, aes(PC1, PC2, colour = factor(COVID))) +
+  geom_point(alpha = 0.7) + labs(colour = "COVID")
+ggplot(pcs, aes(PC1, PC2, colour = factor(severe))) +
+  geom_point(alpha = 0.7) + labs(colour = "Severe")
+
+# flag tubes whose PC1 or PC2 score is more than 4 SD from the mean, and label them on the plot
+pcs <- pcs |>
+  mutate(pca_outlier = abs(PC1 - mean(PC1)) > 4 * sd(PC1) |
+                       abs(PC2 - mean(PC2)) > 4 * sd(PC2))
+
+pcs |> filter(pca_outlier)   # which tubes, if any
+
+ggplot(pcs, aes(PC1, PC2, colour = factor(COVID))) +
+  geom_point(alpha = 0.7) +
+  geom_text_repel(data = filter(pcs, pca_outlier), aes(label = SampleID),
+                  colour = "black", size = 3) +
+  labs(colour = "COVID")
+```
+
+## 3. Clustering: are there protein-defined patient groups?
+
+Among COVID+ patients at Day 0, we take the 50 most variable proteins, z-score them, and cluster patients and proteins hierarchically (Ward's method). We then cut the patient tree into 3 clusters and ask whether the clusters differ in severity. This is unsupervised: severity is not used to form the clusters.
+
+```{r}
+#| label: clustering
+#| fig-height: 9
+covid0 <- day0 |> filter(COVID == 1)
+
+top_var <- covid0 |>
+  group_by(OlinkID) |>
+  summarise(v = var(NPX)) |>
+  slice_max(v, n = 50)
+
+mat <- covid0 |>
+  filter(OlinkID %in% top_var$OlinkID) |>
+  mutate(label = paste(Assay, str_sub(Panel, 1, 4), sep = "_")) |>  # Row label = protein + first 4 letters of its panel (e.g. "IL6_INFL"), unique even for IL6, TNF and CXCL8, which are measured on all 4 panels
+  select(SampleID, label, NPX) |>
+  pivot_wider(names_from = SampleID, values_from = NPX) |>
+  column_to_rownames("label") |>
+  as.matrix()
+
+# imputation
+mat <- t(impute_median(t(mat))) # fill any missing value with the protein's median
+
+# z-scoring
+mat_z <- t(scale(t(mat))) # z-score each protein (row)
+mat_z[mat_z >  3] <-  3   # cap extreme values so colours stay readable
+mat_z[mat_z < -3] <- -3
+
+ann <- covid0 |>
+  distinct(SampleID, severe) |>
+  mutate(severe = factor(severe, levels = c(0, 1), labels = c("no", "yes"))) |>
+  column_to_rownames("SampleID")
+
+hm <- pheatmap(mat_z, annotation_col = ann, show_colnames = FALSE,
+               clustering_method = "ward.D2", cutree_cols = 3, fontsize_row = 6)
+
+# Severity by cluster
+clusters <- cutree(hm$tree_col, k = 3)
+cluster_tab <- table(cluster = clusters, severe = ann[names(clusters), "severe"])
+cluster_tab
+prop.table(cluster_tab, margin = 1)   # share severe within each cluster
+chisq.test(cluster_tab)
+```
+
+## 4. Biomarker discovery: severe vs non-severe at Day 0
+
+One linear model per protein among COVID+ patients at Day 0: `NPX ~ severe + age_cat + KIDNEY`. Age is adjusted for because it drives both severity and many plasma proteins . Kidney disease is adjusted for because poor kidney function raises plasma levels of many small proteins. The coefficient for `severe` is the difference in NPX (log2 fold change). With more than 1,000 tests, p-values are corrected with Benjamini-Hochberg (false discovery rate, FDR).
+
+```{r}
+#| label: differential
+de <- covid0 |>
+  group_by(OlinkID, Assay, UniProt, Panel) |>
+  group_modify(~ tidy(lm(NPX ~ severe + age_cat + KIDNEY, data = .x))) |>
+  ungroup() |>
+  filter(term == "severe") |>
+  mutate(Adjusted_pval = p.adjust(p.value, method = "BH"),
+         Threshold = if_else(Adjusted_pval < 0.05, "Significant", "Non-significant")) |>
+  arrange(p.value)
+
+de |> count(Threshold)
+de |> select(Assay, Panel, estimate, p.value, Adjusted_pval) |> head(15)
+
+# Volcano plot: right = higher in severe, left = lower; higher = more significant
+ggplot(de, aes(estimate, -log10(p.value), colour = Threshold)) +
+  geom_point(alpha = 0.6) +
+  geom_text_repel(data = head(de, 15), aes(label = Assay), size = 3, colour = "black") +
+  labs(x = "Severe - non-severe (NPX, log2 fold change)", y = "-log10 p-value")
+```
+
+## 5. Pathway analysis
+
+**GSEA** ranks all proteins by their effect size from section 4 and asks whether a pathway's proteins sit at the top (NES \> 0, higher in severe) or the bottom (NES \< 0). **ORA** takes only the FDR-significant proteins and asks whether a pathway contains more of them than expected among all measured proteins. With about 1,300 proteins (vs 184 in the example data), many more pathways can be tested.
+
+`olink_pathway_enrichment()` expects Olink's standard columns, so placeholders are added for the ones this file lacks.
+
+```{r}
+#| label: pathways
+
+# IL6, CXCL8 and TNF are measured on all 4 panels; the function needs each
+# protein once, so keep only their Inflammation-panel copy
+drop_ids <- de |>
+  filter(Assay %in% c("IL6", "CXCL8", "TNF"),
+         !str_detect(Panel, regex("inflam", ignore_case = TRUE))) |>
+  pull(OlinkID)
+de_pw <- de |> filter(!OlinkID %in% drop_ids)
+
+day0_olink <- covid0 |>
+  filter(!OlinkID %in% drop_ids) |>
+  mutate(PlateID = "none", QC_Warning = "Pass",
+         Panel_Version = as.character(Panel_Version)) |>
+  select(SampleID, OlinkID, UniProt, Assay, Panel, Panel_Version,
+         PlateID, QC_Warning, LOD, NPX)
+
+gsea <- olink_pathway_enrichment(df = day0_olink, test_results = de,
+                                 method = "GSEA", ontology = "Reactome")
+gsea |>
+  select(Description, setSize, NES, p.adjust, core_enrichment) |>
+  arrange(p.adjust) |>
+  head(15)
+
+olink_pathway_visualization(enrich_results = gsea, method = "GSEA", number_of_terms = 15)
+
+ora <- olink_pathway_enrichment(df = day0_olink, test_results = de,
+                                method = "ORA", ontology = "Reactome")
+if (!is.null(ora)) {
+  ora |> select(Description, Count, GeneRatio, p.adjust) |> arrange(p.adjust) |> head(15)
+}
+```
+
+## 6. Longitudinal analysis: protein trajectories over the first week
+
+One mixed model per protein, COVID+ patients, Day 0, 3 and 7:
+
+`NPX ~ Day * severe + age_cat + (1 | Subject)`
+
+- `Day` (a factor) lets the mean level change between visits.
+- `severe` lets the two groups differ in level.
+- `Day:severe` (the **interaction**) asks whether the groups *change differently* over time. This is the key term.
+- `(1 | Subject)` is a **random intercept**: each person gets their own baseline level, so repeated tubes from the same person are not treated as independent.
+
+Mixed models use every available tube, so patients with only Day 0 still contribute. They give unbiased results if dropout depends on the *observed* data (missing at random), but not if it depends on unobserved values. Here, discharge depends on how ill people were, which is only partly captured.
+
+```{r}
+#| label: mixed-models
+long <- npx |>
+  filter(COVID == 1, Day %in% c("0", "3", "7")) |>
+  mutate(Day = droplevels(Day))
+
+# Fit one model and return the F-test p-value for each term
+fit_one <- function(d) {
+  m <- lmer(NPX ~ Day * severe + age_cat + (1 | Subject), data = d)
+  a <- anova(m) # one p-value per term (F-test); lmerTest estimates the effective sample size (Satterthwaite)
+  tibble(term = rownames(a), p.value = a$`Pr(>F)`)
+}
+
+lmm <- long |>
+  group_by(OlinkID, Assay, Panel) |>
+  group_modify(~ fit_one(.x)) |> # takes a minute or two
+  ungroup() |>
+  group_by(term) |>
+  mutate(Adjusted_pval = p.adjust(p.value, method = "BH")) |>
+  ungroup()
+
+# Number of FDR-significant proteins per term
+lmm |> group_by(term) |> summarise(n_significant = sum(Adjusted_pval < 0.05))
+
+# Top 6 proteins with different trajectories in severe vs non-severe
+top_inter <- lmm |> filter(term == "Day:severe") |> slice_min(p.value, n = 6)
+top_inter
+
+# Mean NPX (± 1 SE) per visit and group
+long |>
+  filter(OlinkID %in% top_inter$OlinkID) |>
+  mutate(label = paste(Assay, str_sub(Panel, 1, 4))) |>
+  group_by(label, Day, severe) |>
+  summarise(mean = mean(NPX), se = sd(NPX) / sqrt(n()), .groups = "drop") |>
+  ggplot(aes(Day, mean, colour = factor(severe), group = factor(severe))) +
+  geom_line() + geom_point() +
+  geom_errorbar(aes(ymin = mean - se, ymax = mean + se), width = 0.1) +
+  facet_wrap(~ label, scales = "free_y") +
+  labs(x = "Day", y = "Mean NPX", colour = "Severe")
+```
+
+## 7. Machine learning: predicting severity from Day 0 proteins
+
+**Set-up.** COVID+ patients, Day 0 proteins, with severe (yes/no) as the outcome. There are about 1,300 predictors for about 300 people: more variables than observations.
+
+**Elastic net** is logistic regression with a penalty that shrinks most coefficients to zero, so it selects a small set of informative proteins. `alpha = 0.5` mixes LASSO (selection) and ridge (stability for correlated proteins).
+
+**Nested cross-validation** keeps the evaluation honest:
+
+- **Outer loop (5 folds):** each fifth of the patients is held out once as a test set, and AUC is measured only on those held-out patients.
+- **Inner loop (`cv.glmnet`, 5 folds within the training data):** chooses the penalty strength (lambda).
+- The whole procedure is repeated 5 times with different random splits, because results from one split are noisy.
+
+**Comparisons.** Clinical only (age and kidney disease), proteins only, and clinical + proteins. The question is whether proteins **add** prediction beyond the clinical variables.
+
+```{r}
+#| label: elastic-net
+# One row per patient: outcome, clinical variables, then one column per protein
+ml <- covid0 |>
+  select(Subject, severe, age_cat, KIDNEY, OlinkID, NPX) |>
+  pivot_wider(names_from = OlinkID, values_from = NPX)
+
+y      <- ml$severe
+X_prot <- ml |> select(starts_with("OID")) |> as.matrix() |> impute_median()
+X_all  <- cbind(as.matrix(ml[, c("age_cat", "KIDNEY")]), X_prot)
+no_pen <- c(0, 0, rep(1, ncol(X_prot)))   # always keep age and kidney (no penalty)
+
+set.seed(2026)
+n_rep <- 5; k <- 5
+preds <- list(); selected <- list()
+
+for (r in 1:n_rep) {                      # repeat 5 times
+  folds <- sample(rep(1:k, length.out = length(y))) # random outer folds gives every patient a random fold number from 1 to 5, as evenly as possible
+  for (f in 1:k) {                        # each fold takes its turn as the test set
+    train <- folds != f                   # TRUE for everyone not in fold f
+    test  <- folds == f                   # TRUE for fold f
+
+    # 3 models, all trained on the training patients only
+    
+    # clinical only - ordinary logistic regression
+    m_clin <- glm(severe ~ age_cat + KIDNEY, data = ml[train, ], family = binomial)
+    
+    # elastic net on proteins only (inner CV picks lambda)
+    m_prot <- cv.glmnet(X_prot[train, ], y[train], family = "binomial",
+                        alpha = 0.5, nfolds = 5, type.measure = "auc")
+    # elastic net on clinical + proteins, with penalty.factor = no_pen
+    m_all  <- cv.glmnet(X_all[train, ], y[train], family = "binomial",
+                        alpha = 0.5, nfolds = 5, type.measure = "auc",
+                        penalty.factor = no_pen)
+    # predict the test patients
+    preds[[length(preds) + 1]] <- tibble( # adds the result to the end of the list
+      rep = r, y = y[test],
+      clinical = predict(m_clin, ml[test, ], type = "response"), # gives probabilities (0–1)
+      proteins = predict(m_prot, X_prot[test, ], s = "lambda.min", type = "response")[, 1], 
+      combined = predict(m_all,  X_all[test, ],  s = "lambda.min", type = "response")[, 1]
+    )                         # s = "lambda.min" uses the lambda with the best inner-CV AUC
+                              # [, 1] turns glmnet’s one-column matrix into a plain vector
+
+    b <- coef(m_prot, s = "lambda.min")[-1, 1] # gives all coefficients + [-1, 1] drops the intercept
+    selected[[length(selected) + 1]] <- names(b)[b != 0] # names(b)[b != 0] gives the proteins with a non-zero coefficient, i.e. the ones selected
+  }
+}
+preds <- bind_rows(preds) # stacks the 25 small tables into one. Within each repeat, every patient appears exactly once
+
+# AUC on held-out patients, per repeat, then the mean
+auc_by_rep <- preds |>
+  group_by(rep) |> # computes the AUC within each repeat, over all ~305 held-out predictions
+  summarise(across(c(clinical, proteins, combined), # does the same calculation for all 3 columns
+                   ~ as.numeric(auc(y, .x, quiet = TRUE))))
+auc_by_rep
+auc_by_rep |> summarise(across(-rep, mean)) # averages over the 5 repeats. The spread across repeats shows how stable the result is.
+
+# 95% CI for the AUC (first repeat; every patient predicted once)
+p1 <- preds |> filter(rep == 1)
+ci.auc(roc(p1$y, p1$proteins, quiet = TRUE))
+ci.auc(roc(p1$y, p1$clinical, quiet = TRUE))
+
+# Does adding proteins improve on clinical variables? (DeLong test, same patients)
+roc.test(roc(p1$y, p1$combined, quiet = TRUE), roc(p1$y, p1$clinical, quiet = TRUE))
+
+# ROC curves (first repeat)
+# One curve per model. x = false positive rate, y = true positive rate.
+# The more a curve bulges toward the top-left corner, the better. The diagonal is chance.
+plot(roc(p1$y, p1$clinical, quiet = TRUE), col = "grey50")
+plot(roc(p1$y, p1$proteins, quiet = TRUE), col = "steelblue", add = TRUE)
+plot(roc(p1$y, p1$combined, quiet = TRUE), col = "darkred", add = TRUE)
+legend("bottomright", c("Clinical", "Proteins", "Combined"),
+       col = c("grey50", "steelblue", "darkred"), lwd = 2)
+
+# Stability: how often was each protein selected across the 25 fits?
+tibble(OlinkID = unlist(selected)) |> # makes one long list of all proteins selected across the 25 fits
+  count(OlinkID, name = "times_selected") |>      # gives how often each protein was picked
+  mutate(share = times_selected / (n_rep * k)) |> # e.g. 0.92 means picked in 23 of 25 fits
+  left_join(assays |> select(OlinkID, Assay, Panel), by = "OlinkID") |>
+                                                  # adds readable protein names
+  arrange(desc(share)) |>
+  head(20)
+# elastic net picks somewhat different proteins in each split. Proteins chosen in > 80% of fits are robust; those picked once or twice are noise
+
+```
+
+## 8. Summary and limitations
+
+- **Preprocessing:** `r length(keep_ids)` of 1,429 proteins kept after LOD filtering; `r length(outlier_samples)` tubes flagged as outliers and removed.
+- **Clustering:** Hierarchical clustering of the 50 most variable proteins, cut into 3 groups, gave one small cluster enriched for severe patients (22 % vs 32 % vs 67 %, χ² p = \< 0.001), with high IL6 and markers of heart, muscle and liver stress.
+- **Biomarkers:** `r sum(de$Adjusted_pval < 0.05)` proteins differed between severe and non-severe patients at Day 0 (FDR \< 5%), led by `r paste(head(de$Assay, 3), collapse = ", ")`.
+- **Pathways:** GSEA (Reactome) found 2 overlapping pathways enriched among proteins higher in severe patients (cellular responses to stimuli, FDR p = 0.001; RNA polymerase II transcription, FDR p = 0.049), driven by inflammation (IL6, CXCL8, CCL2), oxidative stress (PRDX1, SOD2, HMOX1) and hypoxia (ADM, CA9) proteins. No pathway was enriched among lower proteins.
+- **Trajectories:** `r lmm |> dplyr::filter(term == "Day:severe") |> with(sum(Adjusted_pval < 0.05))` proteins changed differently over the first week in severe patients (Day × severity interaction, FDR \< 5%).
+- **Prediction:** proteins gave a cross-validated AUC of `r round(mean(auc_by_rep$proteins), 2)` vs `r round(mean(auc_by_rep$clinical), 2)` for clinical variables alone (`r round(mean(auc_by_rep$combined), 2)` combined).
+
+**Limitations.**
+
+- One hospital and no external validation set; the cross-validated AUC is internal.
+- Later visits are missing not at random (discharged patients are not sampled).
+- Clinical variables are coarse categories; sex was not available.
+- Severity is partly a hospital decision (for example, intubation), not purely biology.
+
+**Link to dementia research.** The same pipeline applies to UK Biobank (Olink Explore 3072, about 50,000 people): Cox models per protein for incident dementia instead of logistic regression, mixed models for repeated cognition or MRI, and an elastic-net protein score tested in an independent cohort such as Gothenburg H70.
